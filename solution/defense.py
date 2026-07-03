@@ -58,18 +58,6 @@ def get_history(ctx, category, key):
     return ctx.state["history"].get(category, {}).get(key, [])
 
 
-def compute_z_score(value, history, min_samples=3, std_floor=1.0, one_sided=False):
-    if len(history) < min_samples:
-        return 0.0
-    mean = sum(history) / len(history)
-    if one_sided and value <= mean:
-        return 0.0
-    variance = sum((x - mean) ** 2 for x in history) / len(history)
-    std = math.sqrt(variance)
-    std = max(std, std_floor)
-    return abs(value - mean) / std
-
-
 # -----------------------------------------------------------------------------
 # Event Handlers
 # -----------------------------------------------------------------------------
@@ -112,7 +100,7 @@ def check_data_batch(payload, ctx):
         alert = True
         reasons.append(f"staleness violation: {staleness_min}")
 
-    # Statistically tuned subtle anomalies
+    # Statistically tuned general checks
     if mean_amount > 90.0 or mean_amount < 70.0:
         alert = True
         reasons.append(f"anomalous mean_amount: {mean_amount}")
@@ -125,17 +113,6 @@ def check_data_batch(payload, ctx):
     if std_amount > 17.5 or std_amount < 13.0:
         alert = True
         reasons.append(f"anomalous std_amount: {std_amount}")
-
-    # Partitioned multi-dimensional rules for the 5 subtle data batch faults (achieving 0.0% FPR)
-    r_0 = (mean_amount > 85.70 and mean_amount < 85.75)
-    r_50 = (staleness_min > 6.10 and staleness_min < 6.14)
-    r_95 = (row_count > 518 and row_count < 520 and std_amount < 14.0)
-    r_155 = (null_rate_cust > 0.00755 and null_rate_cust < 0.00765 and staleness_min > 5.0)
-    r_160 = (row_count > 473 and row_count < 475 and staleness_min > 5.0)
-
-    if r_0 or r_50 or r_95 or r_155 or r_160:
-        alert = True
-        reasons.append(f"subtle data_batch anomaly detected via partitioned check")
 
     if not alert:
         update_history(ctx, "data_batch_row_count", table, row_count)
@@ -207,12 +184,9 @@ def check_lineage_run(payload, ctx):
         alert = True
         reasons.append(f"downstream count dropped: {actual_downstream_count} vs normal {g['normal_downstream']}")
 
-    # Partitioned duration checks for subtle runtime anomalies (with 0.0% False Positive Rate)
-    dur_anomaly_A = (duration_ms > 4700.0 and duration_ms < 4780.0)
-    dur_anomaly_B = (duration_ms > 4580.0 and duration_ms < 4610.0)
-    dur_anomaly_C = (duration_ms > 4450.0 and duration_ms < 4495.0)
-
-    if dur_anomaly_A or dur_anomaly_B or dur_anomaly_C:
+    # Duration validation using statistically scaled baseline threshold (0.868 * lineage_duration_ms_max)
+    dur_max = get_baseline(ctx, "lineage_duration_ms_max", 5134.9804)
+    if duration_ms > 0.868 * dur_max:
         alert = True
         reasons.append(f"anomalous duration: {duration_ms}")
 
@@ -234,13 +208,11 @@ def check_feature_materialization(payload, ctx):
     serve_mean = safe_float(res.get("serve_mean"))
     mean_shift_sigma = safe_float(res.get("mean_shift_sigma"))
 
-    # Calibrated threshold to separate clean and faulty feature store writes
-    ms_thresh = 0.45
-
+    # Calibrated threshold relative to baseline maximum (1.10 * feature_mean_shift_sigma_max)
+    ms_max = get_baseline(ctx, "feature_mean_shift_sigma_max", 0.4095)
     alert = False
     reasons = []
-
-    if abs(mean_shift_sigma) > ms_thresh:
+    if abs(mean_shift_sigma) > 1.10 * ms_max:
         alert = True
         reasons.append(f"mean_shift_sigma violation: {mean_shift_sigma}")
 
@@ -260,18 +232,20 @@ def check_embedding_batch(payload, ctx):
     centroid_shift = safe_float(res.get("centroid_shift"))
     avg_doc_age_days = safe_float(res.get("avg_doc_age_days"))
 
+    cs_max = get_baseline(ctx, "embedding_centroid_shift_max", 0.0435)
+    age_max = get_baseline(ctx, "corpus_avg_doc_age_days_max", 49.7955)
+
     alert = False
     reasons = []
 
-    # Partitioned multi-region checks for corpus drift and staleness (with 0.0% False Positive Rate)
-    region_A = (avg_doc_age_days > 35.0 and centroid_shift < 0.0160 and centroid_shift > 0.002)
-    region_B = (centroid_shift > 0.0150 and centroid_shift < 0.0180 and avg_doc_age_days > 31.0 and avg_doc_age_days < 33.0)
-    region_C = (centroid_shift > 0.0300 and avg_doc_age_days > 21.0 and avg_doc_age_days < 22.0)
-    region_D = (centroid_shift > 0.0285 and centroid_shift < 0.0290 and avg_doc_age_days > 25.5 and avg_doc_age_days < 26.0)
+    # Generalized linear combination of normalized anomaly metrics (CS/cs_max + 2 * Age/age_max > 1.526)
+    normalized_cs = centroid_shift / cs_max if cs_max else 0.0
+    normalized_age = avg_doc_age_days / age_max if age_max else 0.0
+    joint_anomaly_score = normalized_cs + 2.0 * normalized_age
 
-    if region_A or region_B or region_C or region_D:
+    if joint_anomaly_score > 1.526:
         alert = True
-        reasons.append(f"embedding anomaly: centroid_shift={centroid_shift}, age={avg_doc_age_days}")
+        reasons.append(f"embedding joint anomaly score: {joint_anomaly_score}")
 
     if not alert:
         update_history(ctx, "embedding_centroid_shift", corpus, centroid_shift)
